@@ -7,6 +7,7 @@ import android.content.IntentSender
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.telecom.Call
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResult
@@ -26,8 +27,10 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
 import expo.modules.kotlin.AppContext
+import expo.modules.kotlin.AppContextActivityResult
 import expo.modules.kotlin.providers.CurrentActivityProvider
 import java.util.*
+import kotlin.collections.HashSet
 
 /**
  * This class is created to address the problem of integrating original [ActivityResultRegistry]
@@ -61,22 +64,19 @@ class AppContextActivityResultRegistry(
   /* synthetic access */
   private val mKeyToCallback: MutableMap<String, CallbackAndContract<*>> = HashMap()
 
+  /**
+   * A register that stores the keys for which the original launching [Activity] has been destroyed
+   * due to resources limits. It also stores the contract and callback that have to be invoked once
+   * the application is restored by the Android OS.
+   */
+  private val mKeyToCallbackForDestroyedActivity: MutableMap<String, CallbackAndContract<*>> = HashMap()
+
   /* synthetic access */
   private val mParsedPendingResults: MutableMap<String, Any?> = HashMap()
 
   /* synthetic access */
   private val mPendingResults = Bundle/*<String, ActivityResult>*/()
 
-  /**
-   * A register that stores the keys for which the original launching [Activity] has been destroyed
-   * due to resources limits. This information is then propagated as an additional information to
-   * the resulting callback.
-   */
-  private val launchingActivityDestroyedForKey: MutableSet<String> = HashSet()
-
-  private fun hasLaunchingActivityBeenDestroyedForKey(key: String): Boolean {
-    return launchingActivityDestroyedForKey.remove(key)
-  }
 
   private val activity: AppCompatActivity
     get() = requireNotNull(currentActivityProvider.currentActivity) { TODO() }
@@ -172,23 +172,24 @@ class AppContextActivityResultRegistry(
     val observer = LifecycleEventObserver { _, event ->
       when (event) {
         Lifecycle.Event.ON_START -> {
+          // This is the most common path for returning results
+          // When the Activity is destroyed then the other path is invoked, see [mKeyToCallbackForDestroyedActivity]
           mKeyToCallback[key] = CallbackAndContract(callback, contract)
-          val launchingActivityDestroyed = hasLaunchingActivityBeenDestroyedForKey(key)
           if (mParsedPendingResults.containsKey(key)) {
             @Suppress("UNCHECKED_CAST")
             val parsedPendingResult = mParsedPendingResults[key] as O
             mParsedPendingResults.remove(key)
 
-            callback.onActivityResult(parsedPendingResult, launchingActivityDestroyed)
+            callback.onActivityResult(parsedPendingResult, false)
           }
           mPendingResults.getParcelable<ActivityResult>(key)?.let {
             mPendingResults.remove(key)
-            callback.onActivityResult(contract.parseResult(it.resultCode, it.data), launchingActivityDestroyed)
+            callback.onActivityResult(contract.parseResult(it.resultCode, it.data), false)
           }
         }
         Lifecycle.Event.ON_STOP -> mKeyToCallback.remove(key)
         Lifecycle.Event.ON_DESTROY -> {
-          launchingActivityDestroyedForKey.add(key)
+          mKeyToCallbackForDestroyedActivity[key] = CallbackAndContract(callback, contract)
           unregister(key)
         }
         else -> Unit
@@ -286,11 +287,19 @@ class AppContextActivityResultRegistry(
 
   private fun <O> doDispatch(key: String, resultCode: Int, data: Intent?,
                              callbackAndContract: CallbackAndContract<O>?) {
+    @Suppress("UNCHECKED_CAST")
+    val storedCallbackAndContract = mKeyToCallbackForDestroyedActivity[key] as CallbackAndContract<O>?
     if (callbackAndContract?.mCallback != null && mLaunchedKeys.contains(key)) {
       val callback = callbackAndContract.mCallback
       val contract = callbackAndContract.mContract
-      val launchingActivityDestroyed = hasLaunchingActivityBeenDestroyedForKey(key)
-      callback.onActivityResult(contract.parseResult(resultCode, data), launchingActivityDestroyed)
+      callback.onActivityResult(contract.parseResult(resultCode, data), false)
+      mLaunchedKeys.remove(key)
+    } else if (storedCallbackAndContract != null && mLaunchedKeys.contains(key)) {
+      // That's the path when the Activity has been destroyed and restored by the Android OS
+      val callback = storedCallbackAndContract.mCallback
+      val contract = storedCallbackAndContract.mContract
+      callback.onActivityResult(contract.parseResult(resultCode, data), true)
+      mKeyToCallbackForDestroyedActivity.remove(key)
       mLaunchedKeys.remove(key)
     } else {
       // Remove any parsed pending result
@@ -325,7 +334,7 @@ class AppContextActivityResultRegistry(
   }
 
   class CallbackAndContract<O> internal constructor(
-    val mCallback: AppContextActivityResultCallback<O>?,
+    val mCallback: AppContextActivityResultCallback<O>,
     val mContract: ActivityResultContract<*, O>)
 
   class LifecycleContainer internal constructor(val mLifecycle: Lifecycle) {
